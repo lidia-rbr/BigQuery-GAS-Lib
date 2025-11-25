@@ -65,3 +65,6 @@ function fetchRecentData() {
     
     Logger.log("Fetched %s rows.", results.length);
 }
+```
+
+For my details, check my article: https://theappsscriptlab.com/mastering-bigquery-in-apps-script-the-service-account-oauth2-approach/
