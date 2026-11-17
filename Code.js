@@ -1,6 +1,6 @@
 
 /**
- * SuperBQ - BigQuery Library for Google Apps Script.
+ * BigQueryManager - BigQuery Library for Google Apps Script.
  *
  * Features:
  * - Automatic user / service account authentication
