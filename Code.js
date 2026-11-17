@@ -1,10 +1,24 @@
+
 /**
- * BQ Library
- * * A functional library for managing BigQuery interactions within Google Apps Script.
- * * DEPENDENCIES:
- * 1. Library: "OAuth2" (ID: 1B7FSrk5Zi6L1rSxxTDgDEUsPzlukDsi4KGuTMorsTQHhGBzBkMun4iDF)
- * 2. Service: "BigQuery API" (Add via Services +)
- * 3. Script Properties: 'clientEmail' and 'privateKey' must be set.
+ * SuperBQ - BigQuery Library for Google Apps Script.
+ *
+ * Features:
+ * - Automatic user / service account authentication
+ * - BigQuery Standard SQL execution
+ * - Long-running query polling
+ * - Automatic result pagination
+ * - Optional query result caching
+ * - HTTP and query error handling
+ *
+ * DEPENDENCIES:
+ * OAuth2 library (only for service account authentication):
+ * 1B7FSrk5Zi6L1rSxxTDgDEUsPzlukDsi4KGuTMorsTQHhGBzBkMun4iDF
+ *
+ * OPTIONAL SCRIPT PROPERTIES:
+ * - clientEmail
+ * - privateKey
+ *
+ * Without these properties, the executing Google account is used.
  */
 
 // ============================================================================
@@ -12,203 +26,527 @@
 // ============================================================================
 
 const BQ_CONFIG = {
-  projectId: 'your-gcp-project-id-123456', // UPDATE THIS
-  datasetId: 'analytics_data_set',          // UPDATE THIS
+  projectId: 'your-gcp-project-id-123456',
+  datasetId: 'analytics_data_set'
+};
+
+const BQ_CACHE_CONFIG = {
+  chunkSize: 90000,
+  maxParts: 10,
+  maxExpirationSeconds: 21600
 };
 
 // ============================================================================
-// 2. AUTHENTICATION (OAuth2)
+// 2. AUTHENTICATION
 // ============================================================================
 
 /**
- * Creates and returns a configured OAuth2 service for BigQuery.
- * Requires 'clientEmail' and 'privateKey' in Script Properties.
+ * Returns the authentication service for BigQuery.
+ *
+ * Uses a service account when both credentials are configured.
+ * Otherwise, uses the executing user's Google account.
+ *
+ * @returns {Object} Authentication service.
  */
 function getBQOAuthService() {
   const scriptProps = PropertiesService.getScriptProperties();
-  const clientEmail = scriptProps.getProperty("clientEmail");
-  const privateKeyRaw = scriptProps.getProperty("privateKey");
 
-  if (!clientEmail) throw new Error("Property 'clientEmail' not found in Script Properties.");
-  if (!privateKeyRaw) throw new Error("Property 'privateKey' not found in Script Properties.");
+  const clientEmail = scriptProps.getProperty('clientEmail');
+  const privateKeyRaw = scriptProps.getProperty('privateKey');
 
-  // Format private key (handle escaped newlines)
+  // Use current user when no service account is configured.
+  if (!clientEmail && !privateKeyRaw) {
+    console.log('BigQuery authentication: current user');
+
+    return {
+      hasAccess: () => true,
+      getAccessToken: () => ScriptApp.getOAuthToken(),
+      getLastError: () => null
+    };
+  }
+
+  // Prevent incomplete configuration.
+  if (!clientEmail || !privateKeyRaw) {
+    throw new Error(
+      'Incomplete BigQuery service account configuration. ' +
+      'Provide both clientEmail and privateKey, or neither.'
+    );
+  }
+
+  console.log('BigQuery authentication: service account');
+
   const privateKey = privateKeyRaw.replace(/\\n/g, '\n');
 
-  try {
-    return OAuth2.createService('BQ')
-      .setTokenUrl('https://oauth2.googleapis.com/token')
-      .setPrivateKey(privateKey)
-      .setIssuer(clientEmail)
-      .setPropertyStore(scriptProps)
-      .setScope('https://www.googleapis.com/auth/bigquery');
-  } catch (error) {
-    console.error("Error creating OAuth2 service:", error);
-    throw new Error("Failed to initialize BQ OAuth Service: " + error.message);
-  }
+  return OAuth2.createService('BQ')
+    .setTokenUrl('https://oauth2.googleapis.com/token')
+    .setPrivateKey(privateKey)
+    .setIssuer(clientEmail)
+    .setPropertyStore(scriptProps)
+    .setScope('https://www.googleapis.com/auth/bigquery');
 }
 
 // ============================================================================
-// 3. CORE BIGQUERY FUNCTIONS
+// 3. CORE BIGQUERY FUNCTION
 // ============================================================================
 
 /**
- * Executes a BigQuery query (sync/async) and returns the results as an array of objects.
- * Handles caching automatically.
+ * Executes a BigQuery query and returns all result pages.
+ *
+ * Automatically waits for long-running queries and optionally
+ * caches simple SELECT queries.
+ *
+ * Cache is disabled when cacheExpirationMinutes is 0.
+ *
+ * @param {string} query Standard SQL query.
+ * @param {Object} oauthService Authentication service.
+ * @param {string} gcpProject Google Cloud project ID.
+ * @param {number} cacheExpirationMinutes Cache duration in minutes.
+ * @returns {Array<Object>} Query results.
  */
-function runBigQuery(query, oauthService = getBQOAuthService(), gcpProject = BQ_CONFIG.projectId, cacheExpirationMinutes = 300) {
-  const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${gcpProject}/queries`;
-
+function runBigQuery(
+  query,
+  oauthService = getBQOAuthService(),
+  gcpProject = BQ_CONFIG.projectId,
+  cacheExpirationMinutes = 300
+) {
   if (!oauthService.hasAccess()) {
-    throw new Error("BigQuery authorization error: " + oauthService.getLastError());
+    throw new Error(
+      'BigQuery authorization error: ' +
+      oauthService.getLastError()
+    );
   }
 
-  // 1. Check Cache
-  const queryHash = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, query);
-  const cacheKey = `bq_cache_${_convertByteArrayToHex(queryHash)}`;
-  const cachedData = _retrieveFromCache(cacheKey);
+  const accessToken = oauthService.getAccessToken();
 
-  if (cachedData) {
-    console.log('Result retrieved from cache.');
-    return JSON.parse(cachedData);
-  }
-
-  // 2. Execute Query
-  const headers = { Authorization: `Bearer ${oauthService.getAccessToken()}` };
-  const options = {
-    method: "post",
-    headers: headers,
-    contentType: "application/json",
-    payload: JSON.stringify({ query: query, useLegacySql: false }),
-    muteHttpExceptions: true
+  const headers = {
+    Authorization: `Bearer ${accessToken}`
   };
 
+  // Cache only simple SELECT statements.
+  const useCache =
+    cacheExpirationMinutes > 0 &&
+    /^\s*SELECT\b/i.test(query);
+
+  let cacheKey = null;
+
+  // 1. Check cache.
+  if (useCache) {
+    cacheKey = _getBQCacheKey(
+      query,
+      gcpProject,
+      accessToken
+    );
+
+    const cachedData = _retrieveFromCache(cacheKey);
+
+    if (cachedData !== null) {
+      console.log('BigQuery results retrieved from cache.');
+      return JSON.parse(cachedData);
+    }
+  }
+
+  const url =
+    `https://bigquery.googleapis.com/bigquery/v2/projects/` +
+    `${encodeURIComponent(gcpProject)}/queries`;
+
   try {
-    const response = UrlFetchApp.fetch(url, options);
-    const responseData = JSON.parse(response.getContentText());
-    
-    let finalData = [];
-    let pageToken = null;
-    let jobId = responseData?.jobReference?.jobId;
+    // 2. Execute query.
+    const responseData = _fetchBQJson(url, {
+      method: 'post',
+      headers,
+      contentType: 'application/json',
+      payload: JSON.stringify({
+        query,
+        useLegacySql: false
+      })
+    });
 
-    if (jobId && !responseData.jobComplete) {
-      // Long running query
-      console.log(`Job ID: ${jobId} - Waiting asynchronously...`);
-      const jobData = _waitForJobCompletion(gcpProject, jobId, oauthService);
-      
-      if (jobData?.status?.errorResult) throw new Error(`Job failed: ${jobData.status.errorResult.message}`);
-      
-      if (jobData.rows) finalData = _parseBigQueryResponse(jobData);
-      pageToken = jobData.pageToken;
+    const jobId = responseData.jobReference?.jobId;
+    const location = responseData.jobReference?.location;
 
-      // Handle Pagination
-      while (pageToken) {
-        const paginatedUrl = `https://bigquery.googleapis.com/bigquery/v2/projects/${gcpProject}/queries/${jobId}?pageToken=${pageToken}`;
-        const pResp = UrlFetchApp.fetch(paginatedUrl, { method: "get", headers, muteHttpExceptions: true });
-        const pData = JSON.parse(pResp.getContentText());
-        if (pData.rows) finalData = finalData.concat(_parseBigQueryResponse(pData));
-        pageToken = pData.pageToken || null;
+    let result = responseData;
+
+    // 3. Wait if query is still running.
+    if (!result.jobComplete) {
+      if (!jobId) {
+        throw new Error(
+          'BigQuery returned an incomplete query without a job ID.'
+        );
       }
-    } else if (responseData.rows) {
-      // Fast query
-      finalData = _parseBigQueryResponse(responseData);
+
+      console.log(`Waiting for BigQuery job: ${jobId}`);
+
+      result = _waitForJobCompletion(
+        gcpProject,
+        jobId,
+        oauthService,
+        2000,
+        180000,
+        { location }
+      );
     }
 
-    // 3. Store in Cache
-    _storeInCache(cacheKey, JSON.stringify(finalData), cacheExpirationMinutes);
+    // 4. Validate completed query.
+    _checkBQQueryErrors(result);
+
+    // 5. Parse first result page.
+    let finalData = _parseBigQueryResponse(result);
+    let pageToken = result.pageToken || null;
+
+    // 6. Retrieve additional pages.
+    while (pageToken) {
+      if (!jobId) {
+        throw new Error(
+          'Cannot retrieve additional pages without a job ID.'
+        );
+      }
+
+      const params = [
+        `pageToken=${encodeURIComponent(pageToken)}`
+      ];
+
+      if (location) {
+        params.push(
+          `location=${encodeURIComponent(location)}`
+        );
+      }
+
+      const paginatedUrl =
+        `https://bigquery.googleapis.com/bigquery/v2/projects/` +
+        `${encodeURIComponent(gcpProject)}/queries/` +
+        `${encodeURIComponent(jobId)}?${params.join('&')}`;
+
+      const pageData = _fetchBQJson(paginatedUrl, {
+        method: 'get',
+        headers
+      });
+
+      if (!pageData.jobComplete) {
+        throw new Error(
+          `BigQuery result page is not ready: ${jobId}`
+        );
+      }
+
+      _checkBQQueryErrors(pageData);
+
+      finalData = finalData.concat(
+        _parseBigQueryResponse({
+          ...pageData,
+          schema: pageData.schema || result.schema
+        })
+      );
+
+      pageToken = pageData.pageToken || null;
+    }
+
+    // 7. Cache complete results.
+    if (useCache) {
+      _storeInCache(
+        cacheKey,
+        JSON.stringify(finalData),
+        cacheExpirationMinutes
+      );
+    }
+
+    console.log(
+      `BigQuery query completed: ${finalData.length} rows.`
+    );
+
     return finalData;
 
   } catch (error) {
-    console.error("Error executing BigQuery request:", error);
+    console.error('BigQuery execution error:', error);
     throw error;
   }
 }
 
 // ============================================================================
-// 4. INTERNAL HELPER FUNCTIONS
+// 4. BIGQUERY HELPERS
 // ============================================================================
 
-const _MAX_CACHE_SIZE = 100 * 1024;
+/**
+ * Executes a BigQuery REST request and validates HTTP status.
+ *
+ * @param {string} url BigQuery API endpoint.
+ * @param {Object} options UrlFetchApp request options.
+ * @returns {Object} Parsed JSON response.
+ */
+function _fetchBQJson(url, options) {
+  const response = UrlFetchApp.fetch(url, {
+    ...options,
+    muteHttpExceptions: true
+  });
 
-function _storeInCache(key, data, minutes) {
-  const cache = CacheService.getScriptCache();
-  const seconds = minutes * 60;
-  if (data.length > _MAX_CACHE_SIZE) {
-    const parts = Math.ceil(data.length / _MAX_CACHE_SIZE);
-    for (let i = 0; i < parts; i++) {
-      const chunk = data.substring(i * _MAX_CACHE_SIZE, (i + 1) * _MAX_CACHE_SIZE);
-      cache.put(`${key}_p${i}`, chunk, seconds);
+  const status = response.getResponseCode();
+  const body = response.getContentText();
+
+  if (status < 200 || status >= 300) {
+    let message = body;
+
+    try {
+      const errorData = JSON.parse(body);
+      message = errorData.error?.message || body;
+    } catch (error) {
+      // Keep original response body.
     }
-    cache.put(`${key}_count`, parts.toString(), seconds);
-  } else {
-    cache.put(key, data, seconds);
+
+    throw new Error(
+      `BigQuery API error (${status}): ${message}`
+    );
+  }
+
+  return JSON.parse(body);
+}
+
+/**
+ * Validates errors returned by a BigQuery query response.
+ *
+ * @param {Object} response BigQuery query response.
+ * @returns {void}
+ */
+function _checkBQQueryErrors(response) {
+  if (response.jobComplete && response.errors?.length) {
+    const message = response.errors
+      .map(error => error.message || error.reason)
+      .join('; ');
+
+    throw new Error(`BigQuery query error: ${message}`);
   }
 }
 
-function _retrieveFromCache(key) {
-  const cache = CacheService.getScriptCache();
-  const countStr = cache.get(`${key}_count`);
-  if (countStr) {
-    let full = '';
-    const count = parseInt(countStr, 10);
-    for (let i = 0; i < count; i++) {
-      const chunk = cache.get(`${key}_p${i}`);
-      if (!chunk) return null; 
-      full += chunk;
-    }
-    return full;
-  }
-  return cache.get(key);
-}
-
-function _waitForJobCompletion(projectId, jobId, oauthService, interval = 2000, maxWait = 180000, opts = {}) {
+/**
+ * Waits for a BigQuery job and retrieves its first result page.
+ *
+ * Uses jobs.getQueryResults instead of jobs.get.
+ *
+ * @param {string} projectId Google Cloud project ID.
+ * @param {string} jobId BigQuery job ID.
+ * @param {Object} oauthService Authentication service.
+ * @param {number} interval Polling interval in milliseconds.
+ * @param {number} maxWait Maximum waiting time in milliseconds.
+ * @param {Object} opts Additional configuration.
+ * @returns {Object} Completed query results response.
+ */
+function _waitForJobCompletion(
+  projectId,
+  jobId,
+  oauthService,
+  interval = 2000,
+  maxWait = 180000,
+  opts = {}
+) {
   const start = Date.now();
-  const location = opts.location || (
-    typeof BigQuery !== 'undefined'
-      ? BigQuery.Datasets.get(projectId, BQ_CONFIG.datasetId).location
-      : null
-  );
 
-  const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${projectId}/queries/${jobId}` +
-    (location ? `?location=${encodeURIComponent(location)}` : '');
+  const params = ['timeoutMs=1000'];
+
+  if (opts.location) {
+    params.push(
+      `location=${encodeURIComponent(opts.location)}`
+    );
+  }
+
+  const url =
+    `https://bigquery.googleapis.com/bigquery/v2/projects/` +
+    `${encodeURIComponent(projectId)}/queries/` +
+    `${encodeURIComponent(jobId)}?${params.join('&')}`;
 
   while (Date.now() - start < maxWait) {
-    const response = UrlFetchApp.fetch(url, {
+    const result = _fetchBQJson(url, {
       method: 'get',
       headers: {
         Authorization: `Bearer ${oauthService.getAccessToken()}`
-      },
-      muteHttpExceptions: true
+      }
     });
 
-    if (response.getResponseCode() !== 200) {
-      throw new Error(`BigQuery error: ${response.getContentText()}`);
-    }
-
-    const data = JSON.parse(response.getContentText());
-
-    if (data.jobComplete) {
-      return data;
+    if (result.jobComplete) {
+      return result;
     }
 
     Utilities.sleep(interval);
   }
 
-  throw new Error(`Timeout waiting for BigQuery job ${jobId}`);
+  throw new Error(
+    `Timeout waiting for BigQuery job ${jobId}.`
+  );
 }
 
+/**
+ * Converts BigQuery REST result rows into objects.
+ *
+ * Uses the top-level schema to map column names.
+ * Nested and repeated values remain in their REST representation.
+ *
+ * @param {Object} data BigQuery response.
+ * @returns {Array<Object>} Parsed rows.
+ */
 function _parseBigQueryResponse(data) {
-  if (!data.schema || !data.rows) return [];
-  const headers = data.schema.fields.map(f => f.name);
+  if (!data.rows || data.rows.length === 0) {
+    return [];
+  }
+
+  if (!data.schema?.fields) {
+    throw new Error(
+      'BigQuery returned rows without a schema.'
+    );
+  }
+
+  const headers = data.schema.fields.map(
+    field => field.name
+  );
+
   return data.rows.map(row => {
     const obj = {};
-    row.f.forEach((cell, i) => {
-      obj[headers[i]] = cell.v;
+
+    row.f.forEach((cell, index) => {
+      obj[headers[index]] = cell.v;
     });
+
     return obj;
   });
 }
 
+// ============================================================================
+// 5. CACHE HELPERS
+// ============================================================================
+
+/**
+ * Generates a cache key from query, project and access token.
+ *
+ * The token hash isolates cached data between credentials.
+ * Token refreshes can reduce cache reuse.
+ *
+ * @param {string} query SQL query.
+ * @param {string} projectId Google Cloud project ID.
+ * @param {string} accessToken OAuth2 token.
+ * @returns {string} Cache key.
+ */
+function _getBQCacheKey(query, projectId, accessToken) {
+  const input = JSON.stringify({
+    query,
+    projectId,
+    accessToken
+  });
+
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    input
+  );
+
+  return `bq_v2_${_convertByteArrayToHex(digest)}`;
+}
+
+/**
+ * Stores UTF-8 data as Base64 chunks in user cache.
+ *
+ * CacheService supports a maximum of 100 KB per entry
+ * and a maximum expiration of 21600 seconds.
+ *
+ * @param {string} key Cache identifier.
+ * @param {string} data Data to store.
+ * @param {number} minutes Expiration in minutes.
+ * @returns {boolean} Whether data was cached.
+ */
+function _storeInCache(key, data, minutes) {
+  if (!Number.isFinite(minutes) || minutes <= 0) {
+    return false;
+  }
+
+  const cache = CacheService.getUserCache();
+
+  const seconds = Math.min(
+    BQ_CACHE_CONFIG.maxExpirationSeconds,
+    Math.max(1, Math.floor(minutes * 60))
+  );
+
+  const encoded = Utilities.base64Encode(
+    data,
+    Utilities.Charset.UTF_8
+  );
+
+  const chunkSize = BQ_CACHE_CONFIG.chunkSize;
+  const parts = Math.ceil(encoded.length / chunkSize);
+
+  if (parts > BQ_CACHE_CONFIG.maxParts) {
+    console.log(
+      'BigQuery result too large for cache. Skipping.'
+    );
+    return false;
+  }
+
+  // Store data first.
+  for (let i = 0; i < parts; i++) {
+    const chunk = encoded.substring(
+      i * chunkSize,
+      (i + 1) * chunkSize
+    );
+
+    cache.put(`${key}_p${i}`, chunk, seconds);
+  }
+
+  // Write manifest last.
+  cache.put(`${key}_count`, String(parts), seconds);
+
+  return true;
+}
+
+/**
+ * Retrieves and reconstructs cached data.
+ *
+ * @param {string} key Cache identifier.
+ * @returns {?string} Cached data or null.
+ */
+function _retrieveFromCache(key) {
+  const cache = CacheService.getUserCache();
+  const countStr = cache.get(`${key}_count`);
+
+  if (!countStr) {
+    return null;
+  }
+
+  const count = Number(countStr);
+
+  if (
+    !Number.isInteger(count) ||
+    count < 1 ||
+    count > BQ_CACHE_CONFIG.maxParts
+  ) {
+    return null;
+  }
+
+  let encoded = '';
+
+  for (let i = 0; i < count; i++) {
+    const chunk = cache.get(`${key}_p${i}`);
+
+    if (chunk === null) {
+      return null;
+    }
+
+    encoded += chunk;
+  }
+
+  try {
+    const bytes = Utilities.base64Decode(encoded);
+
+    return Utilities.newBlob(bytes)
+      .getDataAsString('UTF-8');
+
+  } catch (error) {
+    console.warn('Invalid BigQuery cache entry:', error);
+    return null;
+  }
+}
+
+/**
+ * Converts a byte array to hexadecimal.
+ *
+ * @param {Array<number>} byteArray Input bytes.
+ * @returns {string} Hexadecimal string.
+ */
 function _convertByteArrayToHex(byteArray) {
-  return byteArray.map(b => ('0' + (b & 0xFF).toString(16)).slice(-2)).join('');
+  return byteArray
+    .map(byte =>
+      ('0' + (byte & 0xFF).toString(16)).slice(-2)
+    )
+    .join('');
 }
